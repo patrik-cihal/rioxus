@@ -1,6 +1,6 @@
 This method interacts with information from the current request. The request may come from:
 
-1. The initial SSR render if this method called from a [`Component`](dioxus_lib::prelude::component) or a [`server`](dioxus_server) function that is called during the initial render
+1. The initial SSR render if this method called from a [`Component`](dioxus_core_macro::component) or a [`server`](dioxus_server) function that is called during the initial render
 
 ```rust
 # use dioxus::prelude::*;
@@ -23,7 +23,7 @@ fn PrintHtmlRequestInfo() -> Element {
 ```rust
 # use dioxus::prelude::*;
 #[server]
-async fn read_headers() -> Result<(), ServerFnError> {
+async fn read_headers() -> ServerFnResult {
     // Since we are calling this from a server function, the server context that is may be from the
     // initial request or a request from the client
     let context = server_context();

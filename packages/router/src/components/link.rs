@@ -2,7 +2,12 @@
 
 use std::fmt::Debug;
 
-use dioxus_lib::prelude::*;
+use dioxus_core::{Attribute, Element, EventHandler, VNode};
+use dioxus_core_macro::{rsx, Props};
+use dioxus_html::{
+    self as dioxus_elements, ModifiersInteraction, MountedEvent, MouseEvent, PointerInteraction,
+};
+use dioxus_signals::{GlobalSignal, Owner, ReadableExt};
 
 use tracing::error;
 
@@ -91,7 +96,6 @@ impl Debug for LinkProps {
 /// # Example
 /// ```rust
 /// # use dioxus::prelude::*;
-/// # use dioxus_router::prelude::*;
 ///
 /// #[derive(Clone, Routable)]
 /// enum Route {
@@ -163,8 +167,11 @@ pub fn Link(props: LinkProps) -> Element {
         NavigationTarget::Internal(url) => url.clone(),
         NavigationTarget::External(route) => route.clone(),
     };
-    // Add the history's prefix to the href for use in the rsx
-    let full_href = router.prefix().unwrap_or_default() + &href;
+    // Add the history's prefix to internal hrefs for use in the rsx
+    let full_href = match &to {
+        NavigationTarget::Internal(url) => router.prefix().unwrap_or_default() + url,
+        NavigationTarget::External(route) => route.clone(),
+    };
 
     let mut class_ = String::new();
     if let Some(c) = class {

@@ -25,18 +25,15 @@ macro_rules! impl_event {
                 #[doc(alias = $js_name)]
             )?
             #[inline]
-            pub fn $name<__Marker>(mut _f: impl ::dioxus_core::prelude::SuperInto<::dioxus_core::prelude::EventHandler<::dioxus_core::Event<$data>>, __Marker>) -> ::dioxus_core::Attribute {
-                // super into will make a closure that is owned by the current owner (either the child component or the parent component).
-                // We can't change that behavior in a minor version because it would cause issues with Components that accept event handlers.
-                // Instead we run super into with an owner that is moved into the listener closure so it will be dropped when the closure is dropped.
-                let owner = <::generational_box::UnsyncStorage as ::generational_box::AnyStorage>::owner();
-                let event_handler = ::dioxus_core::prelude::with_owner(owner.clone(), || _f.super_into());
+            pub fn $name<__Marker>(mut _f: impl ::dioxus_core::SuperInto<::dioxus_core::ListenerCallback<$data>, __Marker>) -> ::dioxus_core::Attribute {
+                let event_handler = _f.super_into();
                 ::dioxus_core::Attribute::new(
                     impl_event!(@name $name $($js_name)?),
                     ::dioxus_core::AttributeValue::listener(move |e: ::dioxus_core::Event<crate::PlatformEventData>| {
-                        // Force the owner to be moved into the event handler
-                        _ = &owner;
-                        event_handler.call(e.map(|e| e.into()));
+                        let event: ::dioxus_core::Event<$data> = e.map(|data| {
+                            data.into()
+                        });
+                        event_handler.call(event.into_any());
                     }),
                     None,
                     false,
@@ -118,6 +115,8 @@ impl PlatformEventData {
 pub trait HtmlEventConverter: Send + Sync {
     /// Convert a general event to an animation data event
     fn convert_animation_data(&self, event: &PlatformEventData) -> AnimationData;
+    /// Convert a general event to a cancel data event
+    fn convert_cancel_data(&self, event: &PlatformEventData) -> CancelData;
     /// Convert a general event to a clipboard data event
     fn convert_clipboard_data(&self, event: &PlatformEventData) -> ClipboardData;
     /// Convert a general event to a composition data event
@@ -161,6 +160,12 @@ pub trait HtmlEventConverter: Send + Sync {
 impl From<&PlatformEventData> for AnimationData {
     fn from(val: &PlatformEventData) -> Self {
         with_event_converter(|c| c.convert_animation_data(val))
+    }
+}
+
+impl From<&PlatformEventData> for CancelData {
+    fn from(val: &PlatformEventData) -> Self {
+        with_event_converter(|c| c.convert_cancel_data(val))
     }
 }
 
@@ -279,6 +284,7 @@ impl From<&PlatformEventData> for WheelData {
 }
 
 mod animation;
+mod cancel;
 mod clipboard;
 mod composition;
 mod drag;
@@ -300,6 +306,7 @@ mod visible;
 mod wheel;
 
 pub use animation::*;
+pub use cancel::*;
 pub use clipboard::*;
 pub use composition::*;
 pub use drag::*;

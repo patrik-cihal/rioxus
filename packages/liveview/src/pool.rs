@@ -5,7 +5,8 @@ use crate::{
     query::{QueryEngine, QueryResult},
     LiveViewError,
 };
-use dioxus_core::prelude::*;
+
+use dioxus_core::{provide_context, Element, Event, ScopeId, VirtualDom};
 use dioxus_html::{EventData, HtmlEvent, PlatformEventData};
 use dioxus_interpreter_js::MutationState;
 use futures_util::{pin_mut, SinkExt, StreamExt};
@@ -30,7 +31,11 @@ impl LiveViewPool {
         dioxus_html::set_event_converter(Box::new(SerializedHtmlEventConverter));
 
         LiveViewPool {
-            pool: LocalPoolHandle::new(16),
+            pool: LocalPoolHandle::new(
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+            ),
         }
     }
 

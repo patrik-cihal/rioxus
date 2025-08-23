@@ -1,7 +1,7 @@
 use crate::Result;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{borrow::Cow, ffi::OsString, path::PathBuf};
 use target_lexicon::Triple;
 
 /// `dx` can act as a linker in a few scenarios. Note that we don't *actually* implement the linker logic,
@@ -80,37 +80,35 @@ impl LinkAction {
         })
     }
 
-    pub(crate) fn write_env_vars(&self, env_vars: &mut Vec<(&str, String)>) -> Result<()> {
-        env_vars.push((Self::DX_LINK_ARG, "1".to_string()));
+    pub(crate) fn write_env_vars(
+        &self,
+        env_vars: &mut Vec<(Cow<'static, str>, OsString)>,
+    ) -> Result<()> {
+        env_vars.push((Self::DX_LINK_ARG.into(), "1".into()));
         env_vars.push((
-            Self::DX_ARGS_FILE,
-            dunce::canonicalize(&self.link_args_file)?
-                .to_string_lossy()
-                .to_string(),
+            Self::DX_ARGS_FILE.into(),
+            dunce::canonicalize(&self.link_args_file)?.into_os_string(),
         ));
         env_vars.push((
-            Self::DX_ERR_FILE,
-            dunce::canonicalize(&self.link_err_file)?
-                .to_string_lossy()
-                .to_string(),
+            Self::DX_ERR_FILE.into(),
+            dunce::canonicalize(&self.link_err_file)?.into_os_string(),
         ));
-        env_vars.push((Self::DX_LINK_TRIPLE, self.triple.to_string()));
+        env_vars.push((Self::DX_LINK_TRIPLE.into(), self.triple.to_string().into()));
         if let Some(linker) = &self.linker {
             env_vars.push((
-                Self::DX_LINK_CUSTOM_LINKER,
+                Self::DX_LINK_CUSTOM_LINKER.into(),
                 dunce::canonicalize(linker)
                     .unwrap_or(linker.clone())
-                    .to_string_lossy()
-                    .to_string(),
+                    .into_os_string(),
             ));
         }
 
         Ok(())
     }
 
-    pub(crate) async fn run_link(self) {
+    pub(crate) fn run_link(self) {
         let link_err_file = self.link_err_file.clone();
-        let res = self.run_link_inner().await;
+        let res = self.run_link_inner();
 
         if let Err(err) = res {
             // If we failed to run the linker, we need to write the error to the file
@@ -124,7 +122,7 @@ impl LinkAction {
     ///
     /// The file will be given by the dx-magic-link-arg env var itself, so we use
     /// it both for determining if we should act as a linker and the for the file name itself.
-    async fn run_link_inner(self) -> Result<()> {
+    fn run_link_inner(self) -> Result<()> {
         let mut args: Vec<_> = std::env::args().collect();
         if args.is_empty() {
             return Ok(());

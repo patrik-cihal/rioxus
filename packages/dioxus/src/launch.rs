@@ -1,7 +1,7 @@
 #![allow(clippy::new_without_default)]
 #![allow(unused)]
 use dioxus_config_macro::*;
-use dioxus_core::LaunchConfig;
+use dioxus_core::{Element, LaunchConfig};
 use std::any::Any;
 
 use crate::prelude::*;
@@ -299,7 +299,7 @@ impl LaunchBuilder {
         // Set any flags if we're running under fullstack
         #[cfg(feature = "fullstack")]
         {
-            use dioxus_fullstack::prelude::server_fn::client::{get_server_url, set_server_url};
+            use dioxus_fullstack::server_fn::client::{get_server_url, set_server_url};
 
             // Make sure to set the server_fn endpoint if the user specified the fullstack feature
             // We only set this on native targets
@@ -332,7 +332,7 @@ impl LaunchBuilder {
 
         #[cfg(feature = "mobile")]
         if matches!(platform, KnownPlatform::Mobile) {
-            return dioxus_mobile::launch_bindings::launch(app, contexts, configs);
+            return dioxus_desktop::launch::launch(app, contexts, configs);
         }
 
         #[cfg(feature = "desktop")]
@@ -347,32 +347,6 @@ impl LaunchBuilder {
 
         #[cfg(feature = "web")]
         if matches!(platform, KnownPlatform::Web) {
-            // If the server feature is enabled, launch the client with hydration enabled
-            #[cfg(feature = "fullstack")]
-            {
-                let platform_config = configs
-                    .into_iter()
-                    .find_map(|cfg| cfg.downcast::<dioxus_web::Config>().ok())
-                    .unwrap_or_default()
-                    .hydrate(true);
-
-                let mut vdom = dioxus_core::VirtualDom::new(app);
-                for context in contexts {
-                    vdom.insert_any_root_context(context());
-                }
-
-                #[cfg(feature = "document")]
-                {
-                    use dioxus_fullstack::FullstackWebDocument;
-                    let document = std::rc::Rc::new(FullstackWebDocument)
-                        as std::rc::Rc<dyn crate::prelude::document::Document>;
-                    vdom.provide_root_context(document);
-                }
-
-                return dioxus_web::launch::launch_virtual_dom(vdom, platform_config);
-            }
-
-            #[cfg(not(any(feature = "fullstack")))]
             return dioxus_web::launch::launch(app, contexts, configs);
         }
 

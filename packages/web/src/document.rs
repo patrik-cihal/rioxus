@@ -1,8 +1,8 @@
-use dioxus_core::prelude::queue_effect;
+use dioxus_core::provide_context;
+use dioxus_core::queue_effect;
 use dioxus_core::ScopeId;
 use dioxus_document::{
-    create_element_in_head, Document, Eval, EvalError, Evaluator, LinkProps, MetaProps,
-    ScriptProps, StyleProps,
+    Document, Eval, EvalError, Evaluator, LinkProps, MetaProps, ScriptProps, StyleProps,
 };
 use dioxus_history::History;
 use futures_util::FutureExt;
@@ -67,16 +67,49 @@ extern "C" {
 
 }
 
+fn init_document_with(document: impl FnOnce(), history: impl FnOnce()) {
+    use dioxus_core::has_context;
+
+    ScopeId::ROOT.in_runtime(|| {
+        if has_context::<Rc<dyn Document>>().is_none() {
+            document();
+        }
+        if has_context::<Rc<dyn History>>().is_none() {
+            history();
+        }
+    })
+}
+
 /// Provides the Document through [`ScopeId::provide_context`].
 pub fn init_document() {
-    let provider: Rc<dyn Document> = Rc::new(WebDocument);
-    if ScopeId::ROOT.has_context::<Rc<dyn Document>>().is_none() {
-        ScopeId::ROOT.provide_context(provider);
+    // If hydrate is enabled, we add the FullstackWebDocument with the initial hydration data
+    #[cfg(not(feature = "hydrate"))]
+    {
+        use dioxus_history::provide_history_context;
+
+        init_document_with(
+            || {
+                provide_context(Rc::new(WebDocument) as Rc<dyn Document>);
+            },
+            || {
+                provide_history_context(Rc::new(WebHistory::default()));
+            },
+        );
     }
-    let history_provider: Rc<dyn History> = Rc::new(WebHistory::default());
-    if ScopeId::ROOT.has_context::<Rc<dyn History>>().is_none() {
-        ScopeId::ROOT.provide_context(history_provider);
-    }
+}
+
+#[cfg(feature = "hydrate")]
+pub fn init_fullstack_document() {
+    use dioxus_fullstack_hooks::{
+        document::FullstackWebDocument, history::provide_fullstack_history_context,
+    };
+
+    init_document_with(
+        || {
+            provide_context(Rc::new(FullstackWebDocument::from(WebDocument)) as Rc<dyn Document>);
+        },
+        || provide_fullstack_history_context(WebHistory::default()),
+    );
 }
 
 /// The web-target's document provider.
@@ -97,43 +130,58 @@ impl Document for WebDocument {
 
     /// Create a new meta tag in the head
     fn create_meta(&self, props: MetaProps) {
-        let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("meta", &props.attributes(), None));
+            append_element_to_head("meta", &props.attributes(), None);
         });
     }
 
     /// Create a new script tag in the head
     fn create_script(&self, props: ScriptProps) {
-        let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
+            append_element_to_head(
                 "script",
                 &props.attributes(),
-                props.script_contents().ok(),
-            ));
+                props.script_contents().ok().as_deref(),
+            );
         });
     }
 
     /// Create a new style tag in the head
     fn create_style(&self, props: StyleProps) {
-        let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
+            append_element_to_head(
                 "style",
                 &props.attributes(),
-                props.style_contents().ok(),
-            ));
+                props.style_contents().ok().as_deref(),
+            );
         });
     }
 
     /// Create a new link tag in the head
     fn create_link(&self, props: LinkProps) {
-        let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("link", &props.attributes(), None));
+            append_element_to_head("link", &props.attributes(), None);
         });
     }
+}
+
+fn append_element_to_head(
+    local_name: &str,
+    attributes: &Vec<(&'static str, String)>,
+    text_content: Option<&str>,
+) {
+    let window = web_sys::window().expect("no global `window` exists");
+    let document = window.document().expect("should have a document on window");
+    let head = document.head().expect("document should have a head");
+
+    let element = document.create_element(local_name).unwrap();
+    for (name, value) in attributes {
+        element.set_attribute(name, value).unwrap();
+    }
+    if text_content.is_some() {
+        element.set_text_content(text_content);
+    }
+    head.append_child(&element).unwrap();
 }
 
 /// Required to avoid blocking the Rust WASM thread.

@@ -1,8 +1,8 @@
-use crate::{cli::*, AppBuilder, BuildRequest, Workspace, PROFILE_SERVER};
-use crate::{BuildMode, Platform};
-use target_lexicon::Triple;
+use dioxus_dx_wire_format::StructuredBuildArtifacts;
 
-use super::target::{TargetArgs, TargetCmd};
+use crate::{
+    cli::*, Anonymized, AppBuilder, BuildArtifacts, BuildMode, BuildRequest, TargetArgs, Workspace,
+};
 
 /// Build the Rust Dioxus app and all of its assets.
 ///
@@ -13,45 +13,52 @@ pub struct BuildArgs {
     /// Enable fullstack mode [default: false]
     ///
     /// This is automatically detected from `dx serve` if the "fullstack" feature is enabled by default.
-    #[clap(long)]
+    #[arg(
+        long,
+        default_missing_value = "true",
+        num_args = 0..=1,
+    )]
     pub(crate) fullstack: Option<bool>,
 
-    /// The feature to use for the client in a fullstack app [default: "web"]
+    /// Pre-render all routes returned from the app's `/static_routes` endpoint [default: false]
     #[clap(long)]
-    pub(crate) client_features: Vec<String>,
+    pub(crate) ssg: bool,
 
-    /// The feature to use for the server in a fullstack app [default: "server"]
+    /// Force a "fat" binary, required to use `dx build-tools hotpatch`
     #[clap(long)]
-    pub(crate) server_features: Vec<String>,
+    pub(crate) fat_binary: bool,
 
-    /// Build with custom profile for the fullstack server
-    #[clap(long, default_value_t = PROFILE_SERVER.to_string())]
-    pub(crate) server_profile: String,
-
-    /// The target to build for the server.
+    /// This flag only applies to fullstack builds. By default fullstack builds will run the server
+    /// and client builds in parallel. This flag will force the build to run the server build first, then the client build. [default: false]
     ///
-    /// This can be different than the host allowing cross-compilation of the server. This is useful for
-    /// platforms like Cloudflare Workers where the server is compiled to wasm and then uploaded to the edge.
-    #[clap(long)]
-    pub(crate) server_target: Option<Triple>,
+    /// If CI is enabled, this will be set to true by default.
+    ///
+    #[clap(
+        long, default_missing_value = "true",
+        num_args = 0..=1,
+    )]
+    pub(crate) force_sequential: Option<bool>,
 
     /// Arguments for the build itself
     #[clap(flatten)]
     pub(crate) build_arguments: TargetArgs,
+}
 
-    /// A list of additional targets to build.
-    ///
-    /// Server and Client are special targets that integrate with `dx serve`, while `crate` is a generic.
-    ///
-    /// ```sh
-    /// dx serve \
-    ///     client --target aarch64-apple-darwin \
-    ///     server --target wasm32-unknown-unknown \
-    ///     crate --target aarch64-unknown-linux-gnu --package foo \
-    ///     crate --target x86_64-unknown-linux-gnu --package bar
-    /// ```
-    #[command(subcommand)]
-    pub(crate) targets: Option<TargetCmd>,
+impl BuildArgs {
+    pub(crate) fn force_sequential_build(&self) -> bool {
+        self.force_sequential
+            .unwrap_or_else(|| std::env::var("CI").is_ok())
+    }
+}
+
+impl Anonymized for BuildArgs {
+    fn anonymized(&self) -> Value {
+        json! {{
+            "fullstack": self.fullstack,
+            "ssg": self.ssg,
+            "build_arguments": self.build_arguments.anonymized(),
+        }}
+    }
 }
 
 pub struct BuildTargets {
@@ -59,122 +66,143 @@ pub struct BuildTargets {
     pub server: Option<BuildRequest>,
 }
 
-impl BuildArgs {
-    pub async fn build(self) -> Result<StructuredOutput> {
-        tracing::info!("Building project...");
-
-        let targets = self.into_targets().await?;
-
-        AppBuilder::start(&targets.client, BuildMode::Base)?
-            .finish_build()
-            .await?;
-
-        tracing::info!(path = ?targets.client.root_dir(), "Client build completed successfully! 🚀");
-
-        if let Some(server) = targets.server.as_ref() {
-            // If the server is present, we need to build it as well
-            AppBuilder::start(server, BuildMode::Base)?
-                .finish_build()
-                .await?;
-
-            tracing::info!(path = ?targets.client.root_dir(), "Server build completed successfully! 🚀");
-        }
-
-        Ok(StructuredOutput::BuildsFinished {
-            client: targets.client.root_dir(),
-            server: targets.server.map(|s| s.root_dir()),
-        })
-    }
-
-    pub async fn into_targets(self) -> Result<BuildTargets> {
+impl CommandWithPlatformOverrides<BuildArgs> {
+    /// We need to decompose the combined `BuildArgs` into the individual targets that we need to build.
+    ///
+    /// Only in a few cases do we spin out an additional server binary:
+    /// - the fullstack feature is passed
+    /// - the fullstack flag is enabled
+    /// - the server flag is enabled
+    ///
+    /// The buildtargets configuration comes in two flavors:
+    /// - implied via the `fullstack` feature
+    /// - explicit when using `@server and @client`
+    ///
+    /// We use the client arguments to build the client target, and then make a few changes to make
+    /// the server target.
+    ///
+    /// The `--fullstack` feature is basically the same as passing `--features fullstack`
+    ///
+    /// Some examples:
+    /// ```shell, ignore
+    /// dx serve --target wasm32-unknown-unknown --fullstack            # serves both client and server
+    /// dx serve --target wasm32-unknown-unknown --features fullstack   # serves both client and server
+    /// dx serve --target wasm32-unknown-unknown                        # only serves the client
+    /// dx serve --target wasm32-unknown-unknown                        # servers both if `fullstack` is enabled on dioxus
+    /// dx serve @client --target wasm32-unknown-unknown                # only serves the client
+    /// dx serve @client --target wasm32-unknown-unknown --fullstack    # serves both client and server
+    /// ```
+    ///
+    /// Currently it is not possible to serve the server without the client, but this could be added in the future.
+    pub async fn into_targets(mut self) -> Result<BuildTargets> {
         let workspace = Workspace::current().await?;
 
         // do some logging to ensure dx matches the dioxus version since we're not always API compatible
         workspace.check_dioxus_version_against_cli();
 
+        // The client args are the `@client` arguments, or the shared build arguments if @client is not specified.
+        let client_args = &self.client.as_ref().unwrap_or(&self.shared).build_arguments;
+
+        // Create the client build request
+        let client = BuildRequest::new(client_args, workspace.clone()).await?;
+
+        // Create the server build request if needed
         let mut server = None;
-
-        let client = match self.targets {
-            // A simple `dx serve` command with no explicit targets
-            None => {
-                // Now resolve the builds that we need to.
-                // These come from the args, but we'd like them to come from the `TargetCmd` chained object
-                //
-                // The process here is as follows:
-                //
-                // - Create the BuildRequest for the primary target
-                // - If that BuildRequest is "fullstack", then add the client features
-                // - If that BuildRequest is "fullstack", then also create a BuildRequest for the server
-                //   with the server features
-                //
-                // This involves modifying the BuildRequest to add the client features and server features
-                // only if we can properly detect that it's a fullstack build. Careful with this, since
-                // we didn't build BuildRequest to be generally mutable.
-                let client = BuildRequest::new(&self.build_arguments, workspace.clone()).await?;
-                let default_server = client
-                    .enabled_platforms
-                    .iter()
-                    .any(|p| *p == Platform::Server);
-
-                // Make sure we set the fullstack platform so we actually build the fullstack variant
-                // Users need to enable "fullstack" in their default feature set.
-                // todo(jon): fullstack *could* be a feature of the app, but right now we're assuming it's always enabled
-                //
-                // Now we need to resolve the client features
-                let fullstack = ((default_server || client.fullstack_feature_enabled())
-                    || self.fullstack.unwrap_or(false))
-                    && self.fullstack != Some(false);
-
-                if fullstack {
-                    let mut build_args = self.build_arguments.clone();
-                    build_args.platform = Some(Platform::Server);
-
-                    let _server = BuildRequest::new(&build_args, workspace.clone()).await?;
-
-                    // ... todo: add the server features to the server build
-                    // ... todo: add the client features to the client build
-                    // // Make sure we have a server feature if we're building a fullstack app
-                    if self.fullstack.unwrap_or_default() && self.server_features.is_empty() {
-                        return Err(anyhow::anyhow!("Fullstack builds require a server feature on the target crate. Add a `server` feature to the crate and try again.").into());
-                    }
-
-                    server = Some(_server);
+        if matches!(self.shared.fullstack, Some(true))
+            || client.fullstack_feature_enabled()
+            || self.server.is_some()
+        {
+            match self.server.as_mut() {
+                Some(server_args) => {
+                    // Make sure we set the client target here so @server knows to place its output into the @client target directory.
+                    server_args.build_arguments.client_target = Some(client.main_target.clone());
+                    server = Some(
+                        BuildRequest::new(&server_args.build_arguments, workspace.clone()).await?,
+                    );
                 }
-
-                client
+                None => {
+                    let mut args = self.shared.build_arguments.clone();
+                    args.platform = Some(crate::Platform::Server);
+                    args.renderer.renderer = Some(crate::Renderer::Server);
+                    args.target = Some(target_lexicon::Triple::host());
+                    server = Some(BuildRequest::new(&args, workspace.clone()).await?);
+                }
             }
-
-            // A command in the form of:
-            // ```
-            // dx serve \
-            //     client --package frontend \
-            //     server --package backend
-            // ```
-            Some(cmd) => {
-                let mut client_args_ = None;
-                let mut server_args_ = None;
-                let mut cmd_outer = Some(Box::new(cmd));
-                while let Some(cmd) = cmd_outer.take() {
-                    match *cmd {
-                        TargetCmd::Client(cmd_) => {
-                            client_args_ = Some(cmd_.inner);
-                            cmd_outer = cmd_.next;
-                        }
-                        TargetCmd::Server(cmd) => {
-                            server_args_ = Some(cmd.inner);
-                            cmd_outer = cmd.next;
-                        }
-                    }
-                }
-
-                if let Some(server_args) = server_args_ {
-                    server = Some(BuildRequest::new(&server_args, workspace.clone()).await?);
-                }
-
-                BuildRequest::new(&client_args_.unwrap(), workspace.clone()).await?
-            }
-        };
+        }
 
         Ok(BuildTargets { client, server })
+    }
+
+    pub async fn build(self) -> Result<StructuredOutput> {
+        tracing::info!("Building project...");
+
+        let force_sequential = self.shared.force_sequential_build();
+        let ssg = self.shared.ssg;
+        let mode = match self.shared.fat_binary {
+            true => BuildMode::Fat,
+            false => BuildMode::Base { run: false },
+        };
+        let targets = self.into_targets().await?;
+
+        let build_client = Self::build_client_inner(&targets.client, mode.clone());
+        let build_server = Self::build_server_inner(&targets.server, mode.clone(), ssg);
+
+        let (client, server) = match force_sequential {
+            true => (build_client.await, build_server.await),
+            false => tokio::join!(build_client, build_server),
+        };
+
+        Ok(StructuredOutput::BuildsFinished {
+            client: client?.into_structured_output(),
+            server: server?.map(|s| s.into_structured_output()),
+        })
+    }
+
+    pub(crate) async fn build_client_inner(
+        request: &BuildRequest,
+        mode: BuildMode,
+    ) -> Result<BuildArtifacts> {
+        AppBuilder::started(request, mode)?
+            .finish_build()
+            .await
+            .inspect(|_| {
+                tracing::info!(path = ?request.root_dir(), "Client build completed successfully! 🚀");
+            })
+    }
+
+    pub(crate) async fn build_server_inner(
+        request: &Option<BuildRequest>,
+        mode: BuildMode,
+        ssg: bool,
+    ) -> Result<Option<BuildArtifacts>> {
+        let Some(server) = request.as_ref() else {
+            return Ok(None);
+        };
+
+        // If the server is present, we need to build it as well
+        let mut server_build = AppBuilder::started(server, mode)?;
+        let server_artifacts = server_build.finish_build().await?;
+
+        // Run SSG and cache static routes
+        if ssg {
+            crate::pre_render_static_routes(None, &mut server_build, None).await?;
+        }
+
+        tracing::info!(path = ?server.root_dir(), "Server build completed successfully! 🚀");
+
+        Ok(Some(server_artifacts))
+    }
+}
+
+impl BuildArtifacts {
+    pub(crate) fn into_structured_output(self) -> StructuredBuildArtifacts {
+        StructuredBuildArtifacts {
+            path: self.root_dir,
+            exe: self.exe,
+            rustc_args: self.direct_rustc.args,
+            rustc_envs: self.direct_rustc.envs,
+            link_args: self.direct_rustc.link_args,
+            assets: self.assets.unique_assets().cloned().collect(),
+        }
     }
 }

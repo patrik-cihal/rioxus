@@ -11,8 +11,10 @@ use axum::{
     routing::IntoMakeService,
 };
 use dioxus_cli_config::base_path;
+use dioxus_core::Element;
+#[cfg(not(target_arch = "wasm32"))]
+use dioxus_core::{RenderError, VNode};
 use dioxus_devtools::DevserverMsg;
-use dioxus_lib::prelude::*;
 use futures_util::{stream::FusedStream, StreamExt};
 use hyper::body::Incoming;
 use hyper_util::server::conn::auto::Builder as HyperBuilder;
@@ -99,7 +101,11 @@ async fn serve_server(
         base_path().map(|s| s.to_string()),
     );
 
-    let task_pool = LocalPoolHandle::new(5);
+    let task_pool = LocalPoolHandle::new(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    );
     let mut make_service = router.into_make_service();
 
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
