@@ -218,22 +218,6 @@ fn suspended_nodes_dont_trigger_effects() {
     }
 
     #[component]
-    fn RerendersFrequently() -> Element {
-        let mut count = use_signal(|| 0);
-
-        use_future(move || async move {
-            for _ in 0..100 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                count.set(count() + 1);
-            }
-        });
-
-        rsx! {
-            div { "rerenders frequently" }
-        }
-    }
-
-    #[component]
     fn Child() -> Element {
         let mut future_resolved = use_signal(|| false);
 
@@ -272,7 +256,7 @@ fn resolved_to_suspended() {
 
             assert_eq!(out, "rendered 1 times");
 
-            dom.in_runtime(|| ScopeId::APP.in_runtime(|| *SUSPENDED.write() = true));
+            dom.in_scope(ScopeId::APP, || *SUSPENDED.write() = true);
 
             dom.render_suspense_immediate().await;
             let out = dioxus_ssr::render(&dom);
@@ -473,22 +457,6 @@ fn toggle_suspense() {
 #[test]
 fn nested_suspense_resolves_client() {
     use Mutation::*;
-
-    async fn poll_three_times() {
-        // Poll each task 3 times
-        let mut count = 0;
-        poll_fn(|cx| {
-            println!("polling... {}", count);
-            if count < 3 {
-                count += 1;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        })
-        .await;
-    }
 
     fn app() -> Element {
         rsx! {

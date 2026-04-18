@@ -26,11 +26,12 @@ use futures_util::{
     StreamExt,
 };
 use hyper::HeaderMap;
+use rustls::crypto::{ring::default_provider, CryptoProvider};
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     fs, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     path::Path,
     sync::{Arc, RwLock},
     time::Duration,
@@ -53,7 +54,6 @@ use super::AppServer;
 /// and better tooling on the pages that we serve.
 pub(crate) struct WebServer {
     devserver_exposed_ip: IpAddr,
-    devserver_bind_ip: IpAddr,
     devserver_port: u16,
     proxied_port: Option<u16>,
     hot_reload_sockets: Vec<ConnectedWsClient>,
@@ -120,7 +120,6 @@ impl WebServer {
         Ok(Self {
             build_status,
             proxied_port,
-            devserver_bind_ip,
             devserver_exposed_ip,
             devserver_port,
             hot_reload_sockets: Default::default(),
@@ -148,7 +147,7 @@ impl WebServer {
                 if let Some(new_socket) = new_hot_reload_socket {
                     let aslr_reference = new_socket.aslr_reference;
                     let pid = new_socket.pid;
-                    let id = new_socket.build_id.unwrap_or(BuildId::CLIENT);
+                    let id = new_socket.build_id.unwrap_or(BuildId::PRIMARY);
 
                     drop(new_message);
                     self.hot_reload_sockets.push(new_socket);
@@ -264,6 +263,7 @@ impl WebServer {
             BuilderUpdate::StderrReceived { .. } => {}
             BuilderUpdate::ProcessExited { .. } => {}
             BuilderUpdate::ProcessWaitFailed { .. } => {}
+            BuilderUpdate::ProfilePhase { .. } => {}
         }
     }
 
@@ -315,6 +315,7 @@ impl WebServer {
             for_build_id: Some(build.0 as _),
         });
         self.send_devserver_message_to_all(msg).await;
+        self.set_ready().await;
     }
 
     /// Tells all clients that a hot patch has started.
@@ -337,12 +338,7 @@ impl WebServer {
 
     /// Tells all clients to reload if possible for new changes.
     pub(crate) async fn send_reload_command(&mut self) {
-        tracing::trace!("Sending reload to toast");
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        self.build_status.set(Status::Ready);
-        self.send_build_status().await;
+        self.set_ready().await;
         self.send_devserver_message_to_all(DevserverMsg::FullReloadCommand)
             .await;
     }
@@ -363,6 +359,16 @@ impl WebServer {
         }
     }
 
+    /// Mark the devserver status as ready and notify listeners.
+    async fn set_ready(&mut self) {
+        if matches!(self.build_status.get(), Status::Ready) {
+            return;
+        }
+
+        self.build_status.set(Status::Ready);
+        self.send_build_status().await;
+    }
+
     /// Get the address the devserver should run on
     pub fn devserver_address(&self) -> SocketAddr {
         SocketAddr::new(self.devserver_exposed_ip, self.devserver_port)
@@ -381,21 +387,38 @@ impl WebServer {
         }
     }
 
-    /// Get the address the server is running - showing 127.0.0.1 if the devserver is bound to 0.0.0.0
-    /// This is designed this way to not confuse users who expect the devserver to be bound to localhost
-    /// ... which it is, but they don't know that 0.0.0.0 also serves localhost.
+    /// Get the address to display to the user as a clickable link.
+    ///
+    /// When bound to 0.0.0.0, resolves the machine's primary network address so the user
+    /// sees a real clickable URL instead of the unroutable 0.0.0.0.
     pub fn displayed_address(&self) -> Option<SocketAddr> {
         let mut address = self.server_address()?;
 
         // Set the port to the devserver port since that's usually what people expect
         address.set_port(self.devserver_port);
 
-        if self.devserver_bind_ip == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
-            address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), address.port());
+        if address.ip().is_unspecified() {
+            match resolve_local_ip() {
+                Some(ip) => address.set_ip(ip),
+                None => {
+                    tracing::debug!("Could not resolve local network IP; displaying localhost");
+                    address.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+                }
+            }
         }
 
         Some(address)
     }
+}
+
+/// Resolve the machine's primary local IP by asking the OS which interface routes to the internet.
+///
+/// Connects a UDP socket to a public address (no traffic is sent) and reads back the local address
+/// the OS selected. Returns `None` if the lookup fails (e.g. no network connectivity).
+fn resolve_local_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip())
 }
 
 async fn devserver_mainloop(
@@ -416,7 +439,10 @@ async fn devserver_mainloop(
         return Ok(());
     }
 
-    // If we're using rustls, we need to get the cert/key paths and then set up rustls
+    // If we're using rustls, we need to install the provider, get the cert/key paths, and then set up rustls
+    if let Err(provider) = CryptoProvider::install_default(default_provider()) {
+        bail!("Failed to install default CryptoProvider: {provider:?}");
+    }
     let (cert_path, key_path) = get_rustls(&https_cfg).await?;
     let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
 
